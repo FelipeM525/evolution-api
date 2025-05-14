@@ -1,27 +1,16 @@
-import { InstanceDto } from '@api/dto/instance.dto';
-import {
-  MediaMessage,
-  Options,
-  SendAudioDto,
-  SendButtonsDto,
-  SendMediaDto,
-  SendTextDto,
-} from '@api/dto/sendMessage.dto';
-import * as s3Service from '@api/integrations/storage/s3/libs/minio.server';
+import { MediaMessage, Options, SendAudioDto, SendMediaDto, SendTextDto } from '@api/dto/sendMessage.dto';
+import { ProviderFiles } from '@api/provider/sessions';
 import { PrismaRepository } from '@api/repository/repository.service';
 import { chatbotController } from '@api/server.module';
 import { CacheService } from '@api/services/cache.service';
 import { ChannelStartupService } from '@api/services/channel.service';
 import { Events, wa } from '@api/types/wa.types';
-import { Chatwoot, ConfigService, Openai, S3 } from '@config/env.config';
+import { Chatwoot, ConfigService, Openai } from '@config/env.config';
 import { BadRequestException, InternalServerErrorException } from '@exceptions';
-import { createJid } from '@utils/createJid';
-import axios from 'axios';
-import { isBase64, isURL } from 'class-validator';
+import { status } from '@utils/renderStatus';
+import { isURL } from 'class-validator';
 import EventEmitter2 from 'eventemitter2';
-import FormData from 'form-data';
-import mimeTypes from 'mime-types';
-import { join } from 'path';
+import mime from 'mime';
 import { v4 } from 'uuid';
 
 export class EvolutionStartupService extends ChannelStartupService {
@@ -31,6 +20,8 @@ export class EvolutionStartupService extends ChannelStartupService {
     public readonly prismaRepository: PrismaRepository,
     public readonly cache: CacheService,
     public readonly chatwootCache: CacheService,
+    public readonly baileysCache: CacheService,
+    private readonly providerFiles: ProviderFiles,
   ) {
     super(configService, eventEmitter, prismaRepository, chatwootCache);
 
@@ -65,34 +56,8 @@ export class EvolutionStartupService extends ChannelStartupService {
     await this.closeClient();
   }
 
-  public setInstance(instance: InstanceDto) {
-    this.logger.setInstance(instance.instanceId);
-
-    this.instance.name = instance.instanceName;
-    this.instance.id = instance.instanceId;
-    this.instance.integration = instance.integration;
-    this.instance.number = instance.number;
-    this.instance.token = instance.token;
-    this.instance.businessId = instance.businessId;
-
-    if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-      this.chatwootService.eventWhatsapp(
-        Events.STATUS_INSTANCE,
-        {
-          instanceName: this.instance.name,
-          instanceId: this.instance.id,
-          integration: instance.integration,
-        },
-        {
-          instance: this.instance.name,
-          status: 'created',
-        },
-      );
-    }
-  }
-
   public async profilePicture(number: string) {
-    const jid = createJid(number);
+    const jid = this.createJid(number);
 
     return {
       wuid: jid,
@@ -113,12 +78,11 @@ export class EvolutionStartupService extends ChannelStartupService {
   }
 
   public async connectToWhatsapp(data?: any): Promise<any> {
-    if (!data) {
-      this.loadChatwoot();
-      return;
-    }
+    if (!data) return;
 
     try {
+      this.loadChatwoot();
+
       this.eventHandler(data);
     } catch (error) {
       this.logger.error(error);
@@ -135,7 +99,6 @@ export class EvolutionStartupService extends ChannelStartupService {
           id: received.key.id || v4(),
           remoteJid: received.key.remoteJid,
           fromMe: received.key.fromMe,
-          profilePicUrl: received.profilePicUrl,
         };
         messageRaw = {
           key,
@@ -147,9 +110,7 @@ export class EvolutionStartupService extends ChannelStartupService {
           instanceId: this.instanceId,
         };
 
-        const isAudio = received?.message?.audioMessage;
-
-        if (this.configService.get<Openai>('OPENAI').ENABLED && isAudio) {
+        if (this.configService.get<Openai>('OPENAI').ENABLED) {
           const openAiDefaultSettings = await this.prismaRepository.openaiSetting.findFirst({
             where: {
               instanceId: this.instanceId,
@@ -204,7 +165,7 @@ export class EvolutionStartupService extends ChannelStartupService {
 
         await this.updateContact({
           remoteJid: messageRaw.key.remoteJid,
-          pushName: messageRaw.pushName,
+          pushName: messageRaw.key.fromMe ? '' : messageRaw.key.fromMe == null ? '' : received.pushName,
           profilePicUrl: received.profilePicUrl,
         });
       }
@@ -214,6 +175,35 @@ export class EvolutionStartupService extends ChannelStartupService {
   }
 
   private async updateContact(data: { remoteJid: string; pushName?: string; profilePicUrl?: string }) {
+    const contact = await this.prismaRepository.contact.findFirst({
+      where: { instanceId: this.instanceId, remoteJid: data.remoteJid },
+    });
+
+    if (contact) {
+      const contactRaw: any = {
+        remoteJid: data.remoteJid,
+        pushName: data?.pushName,
+        instanceId: this.instanceId,
+        profilePicUrl: data?.profilePicUrl,
+      };
+
+      this.sendDataWebhook(Events.CONTACTS_UPDATE, contactRaw);
+
+      if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
+        await this.chatwootService.eventWhatsapp(
+          Events.CONTACTS_UPDATE,
+          { instanceName: this.instance.name, instanceId: this.instanceId },
+          contactRaw,
+        );
+      }
+
+      await this.prismaRepository.contact.updateMany({
+        where: { remoteJid: contact.remoteJid, instanceId: this.instanceId },
+        data: contactRaw,
+      });
+      return;
+    }
+
     const contactRaw: any = {
       remoteJid: data.remoteJid,
       pushName: data?.pushName,
@@ -221,40 +211,11 @@ export class EvolutionStartupService extends ChannelStartupService {
       profilePicUrl: data?.profilePicUrl,
     };
 
-    const existingContact = await this.prismaRepository.contact.findFirst({
-      where: {
-        remoteJid: data.remoteJid,
-        instanceId: this.instanceId,
-      },
-    });
-
-    if (existingContact) {
-      await this.prismaRepository.contact.updateMany({
-        where: {
-          remoteJid: data.remoteJid,
-          instanceId: this.instanceId,
-        },
-        data: contactRaw,
-      });
-    } else {
-      await this.prismaRepository.contact.create({
-        data: contactRaw,
-      });
-    }
-
     this.sendDataWebhook(Events.CONTACTS_UPSERT, contactRaw);
 
-    if (this.configService.get<Chatwoot>('CHATWOOT').ENABLED && this.localChatwoot?.enabled) {
-      await this.chatwootService.eventWhatsapp(
-        Events.CONTACTS_UPDATE,
-        {
-          instanceName: this.instance.name,
-          instanceId: this.instanceId,
-          integration: this.instance.integration,
-        },
-        contactRaw,
-      );
-    }
+    await this.prismaRepository.contact.create({
+      data: contactRaw,
+    });
 
     const chat = await this.prismaRepository.chat.findFirst({
       where: { instanceId: this.instanceId, remoteJid: data.remoteJid },
@@ -286,13 +247,7 @@ export class EvolutionStartupService extends ChannelStartupService {
     });
   }
 
-  protected async sendMessageWithTyping(
-    number: string,
-    message: any,
-    options?: Options,
-    file?: any,
-    isIntegration = false,
-  ) {
+  protected async sendMessageWithTyping(number: string, message: any, options?: Options, isIntegration = false) {
     try {
       let quoted: any;
       let webhookUrl: any;
@@ -317,185 +272,62 @@ export class EvolutionStartupService extends ChannelStartupService {
         webhookUrl = options.webhookUrl;
       }
 
-      let audioFile;
-
       const messageId = v4();
 
-      let messageRaw: any;
+      let messageRaw: any = {
+        key: { fromMe: true, id: messageId, remoteJid: number },
+        messageTimestamp: Math.round(new Date().getTime() / 1000),
+        webhookUrl,
+        source: 'unknown',
+        instanceId: this.instanceId,
+        status: status[1],
+      };
 
       if (message?.mediaType === 'image') {
         messageRaw = {
-          key: { fromMe: true, id: messageId, remoteJid: number },
+          ...messageRaw,
           message: {
-            base64: isBase64(message.media) ? message.media : undefined,
-            mediaUrl: isURL(message.media) ? message.media : undefined,
+            mediaUrl: message.media,
             quoted,
           },
           messageType: 'imageMessage',
-          messageTimestamp: Math.round(new Date().getTime() / 1000),
-          webhookUrl,
-          source: 'unknown',
-          instanceId: this.instanceId,
         };
       } else if (message?.mediaType === 'video') {
         messageRaw = {
-          key: { fromMe: true, id: messageId, remoteJid: number },
+          ...messageRaw,
           message: {
-            base64: isBase64(message.media) ? message.media : undefined,
-            mediaUrl: isURL(message.media) ? message.media : undefined,
+            mediaUrl: message.media,
             quoted,
           },
           messageType: 'videoMessage',
-          messageTimestamp: Math.round(new Date().getTime() / 1000),
-          webhookUrl,
-          source: 'unknown',
-          instanceId: this.instanceId,
         };
       } else if (message?.mediaType === 'audio') {
         messageRaw = {
-          key: { fromMe: true, id: messageId, remoteJid: number },
+          ...messageRaw,
           message: {
-            base64: isBase64(message.media) ? message.media : undefined,
-            mediaUrl: isURL(message.media) ? message.media : undefined,
+            mediaUrl: message.media,
             quoted,
           },
           messageType: 'audioMessage',
-          messageTimestamp: Math.round(new Date().getTime() / 1000),
-          webhookUrl,
-          source: 'unknown',
-          instanceId: this.instanceId,
-        };
-
-        const buffer = Buffer.from(message.media, 'base64');
-        audioFile = {
-          buffer,
-          mimetype: 'audio/mp4',
-          originalname: `${messageId}.mp4`,
         };
       } else if (message?.mediaType === 'document') {
         messageRaw = {
-          key: { fromMe: true, id: messageId, remoteJid: number },
+          ...messageRaw,
           message: {
-            base64: isBase64(message.media) ? message.media : undefined,
-            mediaUrl: isURL(message.media) ? message.media : undefined,
+            mediaUrl: message.media,
             quoted,
           },
           messageType: 'documentMessage',
-          messageTimestamp: Math.round(new Date().getTime() / 1000),
-          webhookUrl,
-          source: 'unknown',
-          instanceId: this.instanceId,
-        };
-      } else if (message.buttonMessage) {
-        messageRaw = {
-          key: { fromMe: true, id: messageId, remoteJid: number },
-          message: {
-            ...message.buttonMessage,
-            buttons: message.buttonMessage.buttons,
-            footer: message.buttonMessage.footer,
-            body: message.buttonMessage.body,
-            quoted,
-          },
-          messageType: 'buttonMessage',
-          messageTimestamp: Math.round(new Date().getTime() / 1000),
-          webhookUrl,
-          source: 'unknown',
-          instanceId: this.instanceId,
-        };
-      } else if (message.listMessage) {
-        messageRaw = {
-          key: { fromMe: true, id: messageId, remoteJid: number },
-          message: {
-            ...message.listMessage,
-            quoted,
-          },
-          messageType: 'listMessage',
-          messageTimestamp: Math.round(new Date().getTime() / 1000),
-          webhookUrl,
-          source: 'unknown',
-          instanceId: this.instanceId,
         };
       } else {
         messageRaw = {
-          key: { fromMe: true, id: messageId, remoteJid: number },
+          ...messageRaw,
           message: {
             ...message,
             quoted,
           },
           messageType: 'conversation',
-          messageTimestamp: Math.round(new Date().getTime() / 1000),
-          webhookUrl,
-          source: 'unknown',
-          instanceId: this.instanceId,
         };
-      }
-
-      if (messageRaw.message.contextInfo) {
-        messageRaw.contextInfo = {
-          ...messageRaw.message.contextInfo,
-        };
-      }
-
-      if (messageRaw.contextInfo?.stanzaId) {
-        const key: any = {
-          id: messageRaw.contextInfo.stanzaId,
-        };
-
-        const findMessage = await this.prismaRepository.message.findFirst({
-          where: {
-            instanceId: this.instanceId,
-            key,
-          },
-        });
-
-        if (findMessage) {
-          messageRaw.contextInfo.quotedMessage = findMessage.message;
-        }
-      }
-
-      const base64 = messageRaw.message.base64;
-      delete messageRaw.message.base64;
-
-      if (base64 || file || audioFile) {
-        if (this.configService.get<S3>('S3').ENABLE) {
-          try {
-            const fileBuffer = audioFile?.buffer || file?.buffer;
-            const buffer = base64 ? Buffer.from(base64, 'base64') : fileBuffer;
-
-            let mediaType: string;
-            let mimetype = audioFile?.mimetype || file.mimetype;
-
-            if (messageRaw.messageType === 'documentMessage') {
-              mediaType = 'document';
-              mimetype = !mimetype ? 'application/pdf' : mimetype;
-            } else if (messageRaw.messageType === 'imageMessage') {
-              mediaType = 'image';
-              mimetype = !mimetype ? 'image/png' : mimetype;
-            } else if (messageRaw.messageType === 'audioMessage') {
-              mediaType = 'audio';
-              mimetype = !mimetype ? 'audio/mp4' : mimetype;
-            } else if (messageRaw.messageType === 'videoMessage') {
-              mediaType = 'video';
-              mimetype = !mimetype ? 'video/mp4' : mimetype;
-            }
-
-            const fileName = `${messageRaw.key.id}.${mimetype.split('/')[1]}`;
-
-            const size = buffer.byteLength;
-
-            const fullName = join(`${this.instance.id}`, messageRaw.key.remoteJid, mediaType, fileName);
-
-            await s3Service.uploadFile(fullName, buffer, size, {
-              'Content-Type': mimetype,
-            });
-
-            const mediaUrl = await s3Service.getObjectUrl(fullName);
-
-            messageRaw.message.mediaUrl = mediaUrl;
-          } catch (error) {
-            this.logger.error(['Error on upload file to minio', error?.message, error?.stack]);
-          }
-        }
       }
 
       this.logger.log(messageRaw);
@@ -543,7 +375,6 @@ export class EvolutionStartupService extends ChannelStartupService {
         mentionsEveryOne: data?.mentionsEveryOne,
         mentioned: data?.mentioned,
       },
-      null,
       isIntegration,
     );
     return res;
@@ -565,7 +396,7 @@ export class EvolutionStartupService extends ChannelStartupService {
         mediaMessage.fileName = 'video.mp4';
       }
 
-      let mimetype: string | false;
+      let mimetype: string;
 
       const prepareMedia: any = {
         caption: mediaMessage?.caption,
@@ -576,9 +407,9 @@ export class EvolutionStartupService extends ChannelStartupService {
       };
 
       if (isURL(mediaMessage.media)) {
-        mimetype = mimeTypes.lookup(mediaMessage.media);
+        mimetype = mime.getType(mediaMessage.media);
       } else {
-        mimetype = mimeTypes.lookup(mediaMessage.fileName);
+        mimetype = mime.getType(mediaMessage.fileName);
       }
 
       prepareMedia.mimetype = mimetype;
@@ -608,78 +439,33 @@ export class EvolutionStartupService extends ChannelStartupService {
         mentionsEveryOne: data?.mentionsEveryOne,
         mentioned: data?.mentioned,
       },
-      file,
       isIntegration,
     );
 
     return mediaSent;
   }
 
-  public async processAudio(audio: string, number: string, file: any) {
+  public async processAudio(audio: string, number: string) {
     number = number.replace(/\D/g, '');
     const hash = `${number}-${new Date().getTime()}`;
 
-    if (process.env.API_AUDIO_CONVERTER) {
-      try {
-        this.logger.verbose('Using audio converter API');
-        const formData = new FormData();
+    let mimetype: string;
 
-        if (file) {
-          formData.append('file', file.buffer, {
-            filename: file.originalname,
-            contentType: file.mimetype,
-          });
-        } else if (isURL(audio)) {
-          formData.append('url', audio);
-        } else {
-          formData.append('base64', audio);
-        }
+    const prepareMedia: any = {
+      fileName: `${hash}.mp4`,
+      mediaType: 'audio',
+      media: audio,
+    };
 
-        formData.append('format', 'mp4');
-
-        const response = await axios.post(process.env.API_AUDIO_CONVERTER, formData, {
-          headers: {
-            ...formData.getHeaders(),
-            apikey: process.env.API_AUDIO_CONVERTER_KEY,
-          },
-        });
-
-        if (!response?.data?.audio) {
-          throw new InternalServerErrorException('Failed to convert audio');
-        }
-
-        const prepareMedia: any = {
-          fileName: `${hash}.mp4`,
-          mediaType: 'audio',
-          media: response?.data?.audio,
-          mimetype: 'audio/mpeg',
-        };
-
-        return prepareMedia;
-      } catch (error) {
-        this.logger.error(error?.response?.data || error);
-        throw new InternalServerErrorException(error?.response?.data?.message || error?.toString() || error);
-      }
+    if (isURL(audio)) {
+      mimetype = mime.getType(audio);
     } else {
-      let mimetype: string;
-
-      const prepareMedia: any = {
-        fileName: `${hash}.mp3`,
-        mediaType: 'audio',
-        media: audio,
-        mimetype: 'audio/mpeg',
-      };
-
-      if (isURL(audio)) {
-        mimetype = mimeTypes.lookup(audio).toString();
-      } else {
-        mimetype = mimeTypes.lookup(prepareMedia.fileName).toString();
-      }
-
-      prepareMedia.mimetype = mimetype;
-
-      return prepareMedia;
+      mimetype = mime.getType(prepareMedia.fileName);
     }
+
+    prepareMedia.mimetype = mimetype;
+
+    return prepareMedia;
   }
 
   public async audioWhatsapp(data: SendAudioDto, file?: any, isIntegration = false) {
@@ -692,7 +478,7 @@ export class EvolutionStartupService extends ChannelStartupService {
       throw new Error('File or buffer is undefined.');
     }
 
-    const message = await this.processAudio(mediaData.audio, data.number, file);
+    const message = await this.processAudio(mediaData.audio, data.number);
 
     const audioSent = await this.sendMessageWithTyping(
       data.number,
@@ -705,34 +491,14 @@ export class EvolutionStartupService extends ChannelStartupService {
         mentionsEveryOne: data?.mentionsEveryOne,
         mentioned: data?.mentioned,
       },
-      file,
       isIntegration,
     );
 
     return audioSent;
   }
 
-  public async buttonMessage(data: SendButtonsDto, isIntegration = false) {
-    return await this.sendMessageWithTyping(
-      data.number,
-      {
-        buttonMessage: {
-          title: data.title,
-          description: data.description,
-          footer: data.footer,
-          buttons: data.buttons,
-        },
-      },
-      {
-        delay: data?.delay,
-        presence: 'composing',
-        quoted: data?.quoted,
-        mentionsEveryOne: data?.mentionsEveryOne,
-        mentioned: data?.mentioned,
-      },
-      null,
-      isIntegration,
-    );
+  public async buttonMessage() {
+    throw new BadRequestException('Method not available on Evolution Channel');
   }
   public async locationMessage() {
     throw new BadRequestException('Method not available on Evolution Channel');

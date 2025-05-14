@@ -224,43 +224,63 @@ export class DifyService {
           headers: {
             Authorization: `Bearer ${dify.apiKey}`,
           },
+          responseType: 'stream',
         });
 
         let conversationId;
         let answer = '';
 
-        const data = response.data.replaceAll('data: ', '');
+        const stream = response.data;
+        const reader = new Readable().wrap(stream);
 
-        const events = data.split('\n').filter((line) => line.trim() !== '');
+        reader.on('data', (chunk) => {
+          const data = chunk.toString().replace(/data:\s*/g, '');
 
-        for (const eventString of events) {
-          if (eventString.trim().startsWith('{')) {
-            const event = JSON.parse(eventString);
-
-            if (event?.event === 'agent_message') {
-              console.log('event:', event);
-              conversationId = conversationId ?? event?.conversation_id;
-              answer += event?.answer;
-            }
+          if (data.trim() === '' || !data.startsWith('{')) {
+            return;
           }
-        }
 
-        if (instance.integration === Integration.WHATSAPP_BAILEYS)
-          await instance.client.sendPresenceUpdate('paused', remoteJid);
+          try {
+            const events = data.split('\n').filter((line) => line.trim() !== '');
 
-        const message = answer;
+            for (const eventString of events) {
+              if (eventString.trim().startsWith('{')) {
+                const event = JSON.parse(eventString);
 
-        await this.sendMessageWhatsApp(instance, remoteJid, message, settings);
+                if (event?.event === 'agent_message') {
+                  console.log('event:', event);
+                  conversationId = conversationId ?? event?.conversation_id;
+                  answer += event?.answer;
+                }
+              }
+            }
+          } catch (error) {
+            console.error('Error parsing stream data:', error);
+          }
+        });
 
-        await this.prismaRepository.integrationSession.update({
-          where: {
-            id: session.id,
-          },
-          data: {
-            status: 'opened',
-            awaitUser: true,
-            sessionId: conversationId,
-          },
+        reader.on('end', async () => {
+          if (instance.integration === Integration.WHATSAPP_BAILEYS)
+            await instance.client.sendPresenceUpdate('paused', remoteJid);
+
+          const message = answer;
+
+          await this.sendMessageWhatsApp(instance, remoteJid, message, settings);
+
+          await this.prismaRepository.integrationSession.update({
+            where: {
+              id: session.id,
+            },
+            data: {
+              status: 'opened',
+              awaitUser: true,
+              sessionId: conversationId,
+            },
+          });
+        });
+
+        reader.on('error', (error) => {
+          console.error('Error reading stream:', error);
         });
 
         return;
@@ -408,8 +428,8 @@ export class DifyService {
               },
               false,
             );
+            textBuffer = '';
           }
-          textBuffer = '';
         }
 
         if (mediaType === 'audio') {

@@ -728,7 +728,13 @@ export class EvolutionBotController extends ChatbotController implements Chatbot
 
       const content = getConversationMessage(msg);
 
-      let findBot = (await this.findBotTrigger(this.botRepository, content, instance, session)) as EvolutionBot;
+      let findBot = (await this.findBotTrigger(
+        this.botRepository,
+        this.settingsRepository,
+        content,
+        instance,
+        session,
+      )) as EvolutionBot;
 
       if (!findBot) {
         const fallback = await this.settingsRepository.findFirst({

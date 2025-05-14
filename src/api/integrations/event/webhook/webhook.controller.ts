@@ -5,7 +5,7 @@ import { wa } from '@api/types/wa.types';
 import { configService, Log, Webhook } from '@config/env.config';
 import { Logger } from '@config/logger.config';
 import { BadRequestException } from '@exceptions';
-import axios, { AxiosInstance } from 'axios';
+import axios from 'axios';
 import { isURL } from 'class-validator';
 
 import { EmitData, EventController, EventControllerInterface } from '../event.controller';
@@ -64,13 +64,12 @@ export class WebhookController extends EventController implements EventControlle
     sender,
     apiKey,
     local,
-    integration,
   }: EmitData): Promise<void> {
-    if (integration && !integration.includes('webhook')) {
+    const instance = (await this.get(instanceName)) as wa.LocalWebHook;
+
+    if (!instance || !instance?.enabled) {
       return;
     }
-
-    const instance = (await this.get(instanceName)) as wa.LocalWebHook;
 
     const webhookConfig = configService.get<Webhook>('WEBHOOK');
     const webhookLocal = instance?.events;
@@ -83,14 +82,14 @@ export class WebhookController extends EventController implements EventControlle
       event,
       instance: instanceName,
       data,
-      destination: instance?.url || `${webhookConfig.GLOBAL.URL}/${transformedWe}`,
+      destination: instance?.url,
       date_time: dateTime,
       sender,
       server_url: serverUrl,
       apikey: apiKey,
     };
 
-    if (local && instance?.enabled) {
+    if (local) {
       if (Array.isArray(webhookLocal) && webhookLocal.includes(we)) {
         let baseURL: string;
 
@@ -117,12 +116,12 @@ export class WebhookController extends EventController implements EventControlle
               headers: webhookHeaders as Record<string, string> | undefined,
             });
 
-            await this.retryWebhookRequest(httpService, webhookData, `${origin}.sendData-Webhook`, baseURL, serverUrl);
+            await httpService.post('', webhookData);
           }
         } catch (error) {
           this.logger.error({
             local: `${origin}.sendData-Webhook`,
-            message: `Todas as tentativas falharam: ${error?.message}`,
+            message: error?.message,
             hostName: error?.hostname,
             syscall: error?.syscall,
             code: error?.code,
@@ -158,18 +157,12 @@ export class WebhookController extends EventController implements EventControlle
           if (isURL(globalURL)) {
             const httpService = axios.create({ baseURL: globalURL });
 
-            await this.retryWebhookRequest(
-              httpService,
-              webhookData,
-              `${origin}.sendData-Webhook-Global`,
-              globalURL,
-              serverUrl,
-            );
+            await httpService.post('', webhookData);
           }
         } catch (error) {
           this.logger.error({
             local: `${origin}.sendData-Webhook-Global`,
-            message: `Todas as tentativas falharam: ${error?.message}`,
+            message: error?.message,
             hostName: error?.hostname,
             syscall: error?.syscall,
             code: error?.code,
@@ -180,53 +173,6 @@ export class WebhookController extends EventController implements EventControlle
             server_url: serverUrl,
           });
         }
-      }
-    }
-  }
-
-  private async retryWebhookRequest(
-    httpService: AxiosInstance,
-    webhookData: any,
-    origin: string,
-    baseURL: string,
-    serverUrl: string,
-    maxRetries = 10,
-    delaySeconds = 30,
-  ): Promise<void> {
-    let attempts = 0;
-
-    while (attempts < maxRetries) {
-      try {
-        await httpService.post('', webhookData);
-        if (attempts > 0) {
-          this.logger.log({
-            local: `${origin}`,
-            message: `Sucesso no envio após ${attempts + 1} tentativas`,
-            url: baseURL,
-          });
-        }
-        return;
-      } catch (error) {
-        attempts++;
-
-        this.logger.error({
-          local: `${origin}`,
-          message: `Tentativa ${attempts}/${maxRetries} falhou: ${error?.message}`,
-          hostName: error?.hostname,
-          syscall: error?.syscall,
-          code: error?.code,
-          error: error?.errno,
-          stack: error?.stack,
-          name: error?.name,
-          url: baseURL,
-          server_url: serverUrl,
-        });
-
-        if (attempts === maxRetries) {
-          throw error;
-        }
-
-        await new Promise((resolve) => setTimeout(resolve, delaySeconds * 1000));
       }
     }
   }

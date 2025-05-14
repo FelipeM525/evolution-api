@@ -13,7 +13,6 @@ export type EmitData = {
   sender: string;
   apiKey?: string;
   local?: boolean;
-  integration?: string[];
 };
 
 export interface EventControllerInterface {
@@ -24,7 +23,7 @@ export interface EventControllerInterface {
 
 export class EventController {
   public prismaRepository: PrismaRepository;
-  protected waMonitor: WAMonitoringService;
+  private waMonitor: WAMonitoringService;
   private integrationStatus: boolean;
   private integrationName: string;
 

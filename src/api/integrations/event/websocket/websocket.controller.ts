@@ -35,16 +35,6 @@ export class WebsocketController extends EventController implements EventControl
       socket.on('disconnect', () => {
         this.logger.info('User disconnected');
       });
-
-      socket.on('sendNode', async (data) => {
-        try {
-          await this.waMonitor.waInstances[data.instanceId].baileysSendNode(data.stanza);
-          this.logger.info('Node sent successfully');
-        } catch (error) {
-          this.logger.error('Error sending node:');
-          this.logger.error(error);
-        }
-      });
     });
 
     this.logger.info('Socket.io initialized');
@@ -75,12 +65,7 @@ export class WebsocketController extends EventController implements EventControl
     dateTime,
     sender,
     apiKey,
-    integration,
   }: EmitData): Promise<void> {
-    if (integration && !integration.includes('websocket')) {
-      return;
-    }
-
     if (!this.status) {
       return;
     }

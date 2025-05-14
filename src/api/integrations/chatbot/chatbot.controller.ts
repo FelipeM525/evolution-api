@@ -184,6 +184,7 @@ export class ChatbotController {
 
   public async findBotTrigger(
     botRepository: any,
+    settingsRepository: any,
     content: string,
     instance: InstanceDto,
     session?: IntegrationSession,
@@ -191,7 +192,7 @@ export class ChatbotController {
     let findBot: null;
 
     if (!session) {
-      findBot = await findBotByTrigger(botRepository, content, instance.instanceId);
+      findBot = await findBotByTrigger(botRepository, settingsRepository, content, instance.instanceId);
 
       if (!findBot) {
         return;
